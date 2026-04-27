@@ -2,184 +2,204 @@ package client
 
 import (
 	"context"
-	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
 
-type stubLogger struct {
-	mu      sync.Mutex
-	entries []string
+type fakeLimiter struct {
+	calls int
+	err   error
 }
 
-func (l *stubLogger) Logf(format string, args ...any) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.entries = append(l.entries, format)
+func (f *fakeLimiter) Wait(_ context.Context) error {
+	f.calls++
+	return f.err
+}
+
+type fakeSleeper struct {
+	calls []time.Duration
+}
+
+func (f *fakeSleeper) Sleep(d time.Duration) {
+	f.calls = append(f.calls, d)
+}
+
+type fakeLogger struct {
+	requests  int
+	responses int
+}
+
+func (f *fakeLogger) LogRequest(_ *http.Request) {
+	f.requests++
+}
+
+func (f *fakeLogger) LogResponse(_ *http.Request, _ *http.Response, _ error, _ time.Duration) {
+	f.responses++
 }
 
 func response(status int, body string) *http.Response {
 	return &http.Response{
 		StatusCode: status,
-		Header:     make(http.Header),
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
 		Body:       io.NopCloser(strings.NewReader(body)),
 	}
 }
 
-func TestRetryLayer_Isolated(t *testing.T) {
+func TestWithRateLimit_WaitsBeforeRequest(t *testing.T) {
+	limiter := &fakeLimiter{}
+	called := 0
+	layer := WithRateLimit(limiter)
+	doer := layer(DoerFunc(func(_ *http.Request) (*http.Response, error) {
+		called++
+		return response(200, "ok"), nil
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com", nil)
+	_, err := doer.Do(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if limiter.calls != 1 {
+		t.Fatalf("expected limiter to be called once, got %d", limiter.calls)
+	}
+	if called != 1 {
+		t.Fatalf("expected downstream to be called once, got %d", called)
+	}
+}
+
+func TestWithRetry_RetriesServerErrors(t *testing.T) {
+	sleeper := &fakeSleeper{}
 	attempts := 0
-	next := DoerFunc(func(req *http.Request) (*http.Response, error) {
+	layer := WithRetry(RetryPolicy{
+		MaxAttempts: 3,
+		BaseDelay:   time.Millisecond,
+		Sleeper:     sleeper,
+		ShouldRetry: func(resp *http.Response, err error) bool {
+			return err != nil || resp.StatusCode >= 500
+		},
+	})
+
+	doer := layer(DoerFunc(func(_ *http.Request) (*http.Response, error) {
 		attempts++
 		if attempts < 3 {
 			return response(500, "fail"), nil
 		}
 		return response(200, "ok"), nil
-	})
-
-	client := Compose(next, WithRetry(RetryConfig{
-		MaxAttempts: 3,
-		BaseDelay:   time.Millisecond,
 	}))
 
-	req, _ := http.NewRequest(http.MethodGet, "https://example.com/items", nil)
-	resp, err := client.Do(req)
+	req := httptest.NewRequest(http.MethodGet, "http://example.com", nil)
+	resp, err := doer.Do(req)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
-	}
-	if resp.StatusCode != 200 {
-		t.Fatalf("unexpected status: %d", resp.StatusCode)
 	}
 	if attempts != 3 {
 		t.Fatalf("expected 3 attempts, got %d", attempts)
 	}
+	if resp.StatusCode != 200 {
+		t.Fatalf("expected status 200, got %d", resp.StatusCode)
+	}
+	if len(sleeper.calls) != 2 {
+		t.Fatalf("expected 2 backoffs, got %d", len(sleeper.calls))
+	}
 }
 
-func TestCacheLayer_Isolated(t *testing.T) {
+func TestWithResponseCache_CachesGetWithinTTL(t *testing.T) {
+	cache := NewTTLCache(10 * time.Second)
 	calls := 0
-	next := DoerFunc(func(req *http.Request) (*http.Response, error) {
+	layer := WithResponseCache(cache)
+	doer := layer(DoerFunc(func(_ *http.Request) (*http.Response, error) {
 		calls++
 		return response(200, "cached"), nil
-	})
+	}))
 
-	cache := NewMemoryCache(time.Minute)
-	client := Compose(next, WithResponseCache(cache))
-
-	req1, _ := http.NewRequest(http.MethodGet, "https://example.com/user", nil)
-	if _, err := client.Do(req1); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	req2, _ := http.NewRequest(http.MethodGet, "https://example.com/user", nil)
-	if _, err := client.Do(req2); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if calls != 1 {
-		t.Fatalf("expected underlying client call once, got %d", calls)
-	}
-}
-
-func TestRateLimitLayer_Isolated(t *testing.T) {
-	limiter, err := NewRateLimiter(1, 1)
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/items", nil)
+	_, _ = doer.Do(req)
+	resp, err := doer.Do(req)
 	if err != nil {
-		t.Fatalf("unexpected setup error: %v", err)
-	}
-
-	calls := 0
-	next := DoerFunc(func(req *http.Request) (*http.Response, error) {
-		calls++
-		return response(200, "ok"), nil
-	})
-	client := Compose(next, WithRateLimit(limiter))
-
-	req1, _ := http.NewRequest(http.MethodGet, "https://example.com/a", nil)
-	if _, err := client.Do(req1); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
-	defer cancel()
-	req2, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://example.com/b", nil)
-	_, err = client.Do(req2)
-	if err == nil {
-		t.Fatalf("expected context timeout while waiting for token")
-	}
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("unexpected error type: %v", err)
-	}
 	if calls != 1 {
-		t.Fatalf("expected one successful call, got %d", calls)
+		t.Fatalf("expected downstream call once, got %d", calls)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "cached" {
+		t.Fatalf("expected cached body, got %q", string(body))
 	}
 }
 
-func TestLoggingLayer_Isolated(t *testing.T) {
-	logger := &stubLogger{}
-	next := DoerFunc(func(req *http.Request) (*http.Response, error) {
+func TestWithLogging_LogsBothRequestAndResponse(t *testing.T) {
+	logger := &fakeLogger{}
+	layer := WithLogging(logger)
+	doer := layer(DoerFunc(func(_ *http.Request) (*http.Response, error) {
 		return response(200, "ok"), nil
-	})
+	}))
 
-	client := Compose(next, WithLogging(logger))
-	req, _ := http.NewRequest(http.MethodGet, "https://example.com/log", nil)
-	if _, err := client.Do(req); err != nil {
+	req := httptest.NewRequest(http.MethodGet, "http://example.com", nil)
+	_, err := doer.Do(req)
+	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-
-	if len(logger.entries) != 1 {
-		t.Fatalf("expected one log entry, got %d", len(logger.entries))
+	if logger.requests != 1 || logger.responses != 1 {
+		t.Fatalf("expected one request and one response log, got %d/%d", logger.requests, logger.responses)
 	}
 }
 
 func TestComposedLayers_WorkTogether(t *testing.T) {
+	limiter := &fakeLimiter{}
+	sleeper := &fakeSleeper{}
+	logger := &fakeLogger{}
+	cache := NewTTLCache(10 * time.Second)
 	attempts := 0
-	logger := &stubLogger{}
-	cache := NewMemoryCache(time.Minute)
-	limiter, err := NewRateLimiter(20, 2)
-	if err != nil {
-		t.Fatalf("unexpected setup error: %v", err)
-	}
 
-	base := DoerFunc(func(req *http.Request) (*http.Response, error) {
+	base := DoerFunc(func(_ *http.Request) (*http.Response, error) {
 		attempts++
 		if attempts == 1 {
-			return response(500, "transient"), nil
+			return response(500, "retry"), nil
 		}
-		return response(200, "payload"), nil
+		return response(200, "ok"), nil
 	})
 
-	client := Compose(
-		base,
+	client := New(base,
 		WithLogging(logger),
 		WithRateLimit(limiter),
-		WithRetry(RetryConfig{MaxAttempts: 3, BaseDelay: time.Millisecond}),
+		WithRetry(RetryPolicy{
+			MaxAttempts: 2,
+			BaseDelay:   time.Millisecond,
+			Sleeper:     sleeper,
+			ShouldRetry: DefaultRetryPolicy().ShouldRetry,
+		}),
 		WithResponseCache(cache),
 	)
 
-	req1, _ := http.NewRequest(http.MethodGet, "https://example.com/data", nil)
-	resp1, err := client.Do(req1)
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/composed", nil)
+	resp1, err := client.Do(req)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if resp1.StatusCode != 200 {
-		t.Fatalf("unexpected first response status: %d", resp1.StatusCode)
+		t.Fatalf("expected status 200, got %d", resp1.StatusCode)
 	}
 
-	req2, _ := http.NewRequest(http.MethodGet, "https://example.com/data", nil)
-	resp2, err := client.Do(req2)
+	resp2, err := client.Do(httptest.NewRequest(http.MethodGet, "http://example.com/composed", nil))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if resp2.StatusCode != 200 {
-		t.Fatalf("unexpected second response status: %d", resp2.StatusCode)
+		t.Fatalf("expected status 200, got %d", resp2.StatusCode)
 	}
 
 	if attempts != 2 {
-		t.Fatalf("expected exactly 2 base attempts (retry then cache hit), got %d", attempts)
+		t.Fatalf("expected base doer attempts 2 (first call retries, second cached), got %d", attempts)
 	}
-	if len(logger.entries) != 2 {
-		t.Fatalf("expected two logs, got %d", len(logger.entries))
+	if limiter.calls != 2 {
+		t.Fatalf("expected limiter to run once per top-level request, got %d", limiter.calls)
+	}
+	if logger.requests != 2 || logger.responses != 2 {
+		t.Fatalf("expected two log calls, got %d/%d", logger.requests, logger.responses)
 	}
 }

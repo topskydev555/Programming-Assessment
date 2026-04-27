@@ -1,44 +1,41 @@
-import { ApiClient, ApiRequest } from "./types";
+import { ApiClient } from "./types";
 
-export class MockApiClient implements ApiClient {
-  private readonly failuresByKey = new Map<string, number>();
-  private readonly waitsByKey = new Map<string, number>();
+type DemoPayload = {
+  id: string;
+  value: string;
+  fetchedAt: string;
+};
 
-  setTransientFailures(key: string, failCount: number): void {
-    this.failuresByKey.set(key, failCount);
-  }
+let failureCountdown = 1;
 
-  setDelayMs(key: string, delayMs: number): void {
-    this.waitsByKey.set(key, delayMs);
-  }
-
-  async request<TData>(request: ApiRequest, signal?: AbortSignal): Promise<TData> {
-    const delayMs = this.waitsByKey.get(request.key) ?? 500;
-    await this.sleep(delayMs, signal);
-
-    const left = this.failuresByKey.get(request.key) ?? 0;
-    if (left > 0) {
-      this.failuresByKey.set(request.key, left - 1);
-      throw new Error("Transient API error");
-    }
-
-    const payload = {
-      key: request.key,
-      url: request.url,
-      at: new Date().toISOString(),
-      message: "Gateway response payload",
-    };
-
-    return payload as TData;
-  }
-
-  private sleep(ms: number, signal?: AbortSignal): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(resolve, ms);
-      signal?.addEventListener("abort", () => {
-        clearTimeout(timer);
-        reject(new DOMException("Aborted", "AbortError"));
-      });
-    });
-  }
+export function setMockFailuresBeforeSuccess(count: number) {
+  failureCountdown = count;
 }
+
+export const mockApiClient: ApiClient = async <T>(
+  key: string,
+  signal?: AbortSignal
+): Promise<T> => {
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => resolve(), 150);
+    signal?.addEventListener("abort", () => {
+      clearTimeout(timer);
+      const error = new Error("Aborted");
+      error.name = "AbortError";
+      reject(error);
+    });
+  });
+
+  if (failureCountdown > 0) {
+    failureCountdown -= 1;
+    throw new Error("Temporary upstream error");
+  }
+
+  const payload: DemoPayload = {
+    id: key,
+    value: "Demo payload",
+    fetchedAt: new Date().toISOString(),
+  };
+
+  return payload as T;
+};

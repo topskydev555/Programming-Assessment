@@ -1,20 +1,18 @@
-export type ApiMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+export type ApiClient = <T>(
+  key: string,
+  signal?: AbortSignal
+) => Promise<T>;
 
-export type ApiRequest<TBody = unknown> = {
-  key: string;
-  url: string;
-  method?: ApiMethod;
-  headers?: Record<string, string>;
-  body?: TBody;
-};
-
-export interface ApiClient {
-  request<TData>(request: ApiRequest, signal?: AbortSignal): Promise<TData>;
+export interface ApiErrorShape {
+  message: string;
+  code?: string;
 }
 
-export type CacheEntry<TData> = {
-  value: TData;
-  expiresAt: number;
-};
-
-export type RequestState = "idle" | "loading" | "success" | "error" | "cancelled";
+export interface RequestState<T> {
+  data: T | null;
+  error: ApiErrorShape | null;
+  loading: boolean;
+  retrying: boolean;
+  fromCache: boolean;
+  attempts: number;
+}

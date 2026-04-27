@@ -1,3 +1,3 @@
-module task3/gatewayclient
+module gatewayclient
 
 go 1.22

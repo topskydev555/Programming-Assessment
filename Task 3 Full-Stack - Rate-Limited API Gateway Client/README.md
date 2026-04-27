@@ -1,51 +1,43 @@
-# Task 3 - Full-Stack Rate-Limited API Gateway Client
+# Task 3 - Rate-Limited API Gateway Client
 
-This task is split into two independent modules:
+This task contains two parts:
 
-- `go-client`: composable Go HTTP client wrapper with cross-cutting layers
-- `mobile-app`: Expo React Native app with `useApiClient` hook and demo UI
+- `go-client`: composable HTTP client wrapper with independent cross-cutting layers.
+- `mobile-app`: React Native hook stack with dedupe, optimistic TTL cache, retry state, and cancellation.
 
-## Go Side
+## Go side
 
-### Features
+Path: `go-client/client`
 
-- Base `Doer` abstraction (`Do(req)`) for layer composition
-- Rate limiting layer (token bucket)
-- Retry layer with exponential backoff
-- TTL response cache layer for GET requests
-- Request/response logging layer
-- Tests for each layer in isolation and composed behavior
+Layers:
 
-### Run tests
+- `WithRateLimit`: blocks each request by calling a limiter abstraction.
+- `WithRetry`: retries transient failures using exponential backoff.
+- `WithResponseCache`: caches successful GET responses with TTL.
+- `WithLogging`: records request and response lifecycle.
+
+Composition uses `Chain` and `Client` in `client.go`, so each layer is swappable and testable in isolation.
+
+Run tests:
 
 ```bash
-cd go-client
+cd "Task 3 Full-Stack - Rate-Limited API Gateway Client/go-client"
 go test ./...
 ```
 
-## React Native Side
+## React Native side
 
-### Features
+Path: `mobile-app/src`
 
-- `useApiClient` hook with:
-  - request deduplication
-  - optimistic cache (TTL)
-  - auto retry with exponential backoff
-  - cancellation support on unmount
-- Demo screen with visible state transitions (`idle`, `loading`, `success`, `error`, `cancelled`)
-- Request manager extracted into pure TypeScript class for unit testing
+Core logic:
 
-### Run app and tests
+- `ApiRequestManager`: pure request orchestration layer (dedupe/cache/retry/cancel).
+- `useApiClient`: hook wrapper translating manager events into UI state.
+- `ApiClientDemoScreen`: demo screen showing state transitions.
+
+Run tests:
 
 ```bash
-cd mobile-app
-npm install
-npm run test
-npm start
+cd "Task 3 Full-Stack - Rate-Limited API Gateway Client/mobile-app"
+npm test
 ```
-
-## Design notes
-
-- Each cross-cutting concern remains independent and composable.
-- Both modules keep framework-specific code at the edges.
-- Core behavior is testable without network calls or UI runtime.

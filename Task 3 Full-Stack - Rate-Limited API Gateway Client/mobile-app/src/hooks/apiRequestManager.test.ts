@@ -1,73 +1,100 @@
-import { describe, expect, it } from "vitest";
-import { ApiClient, ApiRequest } from "../api/types";
+import { describe, expect, it, vi } from "vitest";
 import { ApiRequestManager } from "./apiRequestManager";
+import { ApiClient } from "../api/types";
 
-class StubApiClient implements ApiClient {
-  public calls = 0;
-  private failures = 0;
-
-  setFailures(count: number) {
-    this.failures = count;
-  }
-
-  async request<TData>(request: ApiRequest, signal?: AbortSignal): Promise<TData> {
-    this.calls++;
-    if (signal?.aborted) {
-      throw new DOMException("Aborted", "AbortError");
-    }
-    if (this.failures > 0) {
-      this.failures--;
-      throw new Error("Transient");
-    }
-    return { key: request.key, ok: true } as TData;
-  }
-}
+type Payload = { value: string };
 
 describe("ApiRequestManager", () => {
-  it("deduplicates concurrent requests by key", async () => {
-    const client = new StubApiClient();
-    const manager = new ApiRequestManager(client, {
-      ttlMs: 1_000,
-      retry: { maxAttempts: 1, baseDelayMs: 1 },
-    });
+  it("deduplicates concurrent requests", async () => {
+    let callCount = 0;
+    const client: ApiClient = async () => {
+      callCount += 1;
+      await Promise.resolve();
+      return { value: "ok" };
+    };
 
-    const req = { key: "a", url: "/a", method: "GET" as const };
-    const [r1, r2] = await Promise.all([manager.run(req), manager.run(req)]);
+    const manager = new ApiRequestManager<Payload>(
+      client,
+      { maxAttempts: 2, baseDelayMs: 10, delayFn: vi.fn() },
+      { ttlMs: 1_000 },
+      () => 1000
+    );
 
-    expect(r1.data).toEqual(r2.data);
-    expect(client.calls).toBe(1);
+    const [a, b] = await Promise.all([
+      manager.execute("k1"),
+      manager.execute("k1"),
+    ]);
+
+    expect(callCount).toBe(1);
+    expect(a.data?.value).toBe("ok");
+    expect(b.data?.value).toBe("ok");
   });
 
-  it("retries transient failures", async () => {
-    const client = new StubApiClient();
-    client.setFailures(2);
-    const manager = new ApiRequestManager(client, {
-      ttlMs: 1_000,
-      retry: { maxAttempts: 3, baseDelayMs: 1 },
-    });
-
-    const req = { key: "b", url: "/b", method: "GET" as const };
-    const result = await manager.run(req);
-
-    expect(result.data).toEqual({ key: "b", ok: true });
-    expect(client.calls).toBe(3);
-  });
-
-  it("serves cached response before ttl expiration", async () => {
-    const client = new StubApiClient();
+  it("returns optimistic cache when ttl is valid", async () => {
     let now = 1000;
-    const manager = new ApiRequestManager(client, {
-      ttlMs: 50,
-      retry: { maxAttempts: 1, baseDelayMs: 1 },
-      now: () => now,
+    const clientMock = vi.fn(async () => ({ value: "cached" }));
+    const client: ApiClient = clientMock;
+    const manager = new ApiRequestManager<Payload>(
+      client,
+      { maxAttempts: 2, baseDelayMs: 10, delayFn: vi.fn() },
+      { ttlMs: 500 },
+      () => now
+    );
+
+    const first = await manager.execute("k2");
+    now = 1200;
+    const second = await manager.execute("k2");
+
+    expect(first.fromCache).toBe(false);
+    expect(second.fromCache).toBe(true);
+    expect(clientMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries with exponential delay before failing", async () => {
+    const delayFn = vi.fn(async () => {});
+    const client: ApiClient = vi.fn(async () => {
+      throw new Error("boom");
     });
 
-    const req = { key: "c", url: "/c", method: "GET" as const };
-    await manager.run(req);
-    now += 10;
-    const second = await manager.run(req);
+    const manager = new ApiRequestManager<Payload>(
+      client,
+      { maxAttempts: 3, baseDelayMs: 100, delayFn },
+      { ttlMs: 500 },
+      () => 1000
+    );
 
-    expect(second.fromCache).toBe(true);
-    expect(client.calls).toBe(1);
+    const result = await manager.execute("k3");
+
+    expect(result.error?.message).toBe("boom");
+    expect(result.attempts).toBe(3);
+    expect(delayFn).toHaveBeenCalledTimes(2);
+    expect(delayFn).toHaveBeenNthCalledWith(1, 100);
+    expect(delayFn).toHaveBeenNthCalledWith(2, 200);
+  });
+
+  it("cancels inflight requests", async () => {
+    const client: ApiClient = async (_key, signal) => {
+      return new Promise<Payload>((resolve, reject) => {
+        signal?.addEventListener("abort", () => {
+          const err = new Error("aborted");
+          err.name = "AbortError";
+          reject(err);
+        });
+        setTimeout(() => resolve({ value: "late" }), 1000);
+      });
+    };
+
+    const manager = new ApiRequestManager<Payload>(
+      client,
+      { maxAttempts: 1, baseDelayMs: 10, delayFn: vi.fn() },
+      { ttlMs: 500 },
+      () => 1000
+    );
+
+    const promise = manager.execute("k4");
+    manager.cancelAll();
+    const result = await promise;
+
+    expect(result.error?.code).toBe("CANCELLED");
   });
 });

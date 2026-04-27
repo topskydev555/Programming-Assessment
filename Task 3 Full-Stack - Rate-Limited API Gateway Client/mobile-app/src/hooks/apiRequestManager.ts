@@ -1,112 +1,139 @@
-import { ApiClient, ApiRequest, CacheEntry } from "../api/types";
+import { toApiError } from "../api/errors";
+import { ApiClient, RequestState } from "../api/types";
 
-export type RetryOptions = {
+type RetryConfig = {
   maxAttempts: number;
   baseDelayMs: number;
+  delayFn?: (ms: number) => Promise<void>;
 };
 
-export type ManagerOptions = {
+type CacheConfig = {
   ttlMs: number;
-  retry: RetryOptions;
-  now?: () => number;
 };
 
-type InFlight<TData> = {
-  promise: Promise<TData>;
+type CacheEntry<T> = {
+  value: T;
+  expiresAt: number;
+};
+
+type InflightRequest<T> = {
+  promise: Promise<RequestState<T>>;
   controller: AbortController;
 };
 
-export class ApiRequestManager {
+const defaultDelay = (ms: number) =>
+  new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+export class ApiRequestManager<T> {
   private readonly client: ApiClient;
-  private readonly ttlMs: number;
-  private readonly retry: RetryOptions;
-  private readonly now: () => number;
-  private readonly cache = new Map<string, CacheEntry<unknown>>();
-  private readonly inFlight = new Map<string, InFlight<unknown>>();
+  private readonly retry: RetryConfig;
+  private readonly cache: CacheConfig;
+  private readonly inflight = new Map<string, InflightRequest<T>>();
+  private readonly optimisticCache = new Map<string, CacheEntry<T>>();
+  private readonly nowFn: () => number;
 
-  constructor(client: ApiClient, options: ManagerOptions) {
+  constructor(
+    client: ApiClient,
+    retry: RetryConfig,
+    cache: CacheConfig,
+    nowFn: () => number = () => Date.now()
+  ) {
     this.client = client;
-    this.ttlMs = options.ttlMs;
-    this.retry = options.retry;
-    this.now = options.now ?? (() => Date.now());
+    this.retry = retry;
+    this.cache = cache;
+    this.nowFn = nowFn;
   }
 
-  getCached<TData>(key: string): TData | null {
-    const entry = this.cache.get(key);
-    if (!entry) return null;
-    if (this.now() > entry.expiresAt) {
-      this.cache.delete(key);
-      return null;
+  async execute(
+    key: string,
+    onRetry?: (attempt: number, nextDelayMs: number) => void
+  ): Promise<RequestState<T>> {
+    const now = this.nowFn();
+    const cached = this.optimisticCache.get(key);
+    if (cached && cached.expiresAt > now) {
+      return {
+        data: cached.value,
+        error: null,
+        loading: false,
+        retrying: false,
+        fromCache: true,
+        attempts: 0,
+      };
     }
-    return entry.value as TData;
-  }
 
-  async run<TData>(request: ApiRequest): Promise<{ data: TData; fromCache: boolean }> {
-    const cached = this.getCached<TData>(request.key);
-    if (cached != null) {
-      return { data: cached, fromCache: true };
-    }
-
-    const existing = this.inFlight.get(request.key);
+    const existing = this.inflight.get(key);
     if (existing) {
-      const data = (await existing.promise) as TData;
-      return { data, fromCache: false };
+      return existing.promise;
     }
 
     const controller = new AbortController();
-    const promise = this.executeWithRetry<TData>(request, controller.signal)
-      .then((data) => {
-        this.cache.set(request.key, {
-          value: data,
-          expiresAt: this.now() + this.ttlMs,
-        });
-        return data;
-      })
-      .finally(() => {
-        this.inFlight.delete(request.key);
-      });
+    const promise = this.runWithRetry(key, controller.signal, onRetry).finally(
+      () => {
+        this.inflight.delete(key);
+      }
+    );
 
-    this.inFlight.set(request.key, { promise, controller });
-    const data = await promise;
-    return { data, fromCache: false };
+    this.inflight.set(key, { promise, controller });
+    return promise;
   }
 
-  cancel(key?: string): void {
-    if (key) {
-      const item = this.inFlight.get(key);
-      item?.controller.abort();
-      return;
-    }
-
-    for (const item of this.inFlight.values()) {
-      item.controller.abort();
-    }
+  cancelAll() {
+    this.inflight.forEach(({ controller }) => controller.abort());
+    this.inflight.clear();
   }
 
-  private async executeWithRetry<TData>(request: ApiRequest, signal: AbortSignal): Promise<TData> {
-    let lastErr: unknown;
-    for (let attempt = 1; attempt <= this.retry.maxAttempts; attempt++) {
+  private async runWithRetry(
+    key: string,
+    signal: AbortSignal,
+    onRetry?: (attempt: number, nextDelayMs: number) => void
+  ): Promise<RequestState<T>> {
+    let attempts = 0;
+    let lastError: unknown;
+
+    for (let attempt = 1; attempt <= this.retry.maxAttempts; attempt += 1) {
+      attempts = attempt;
       try {
-        return await this.client.request<TData>(request, signal);
+        const data = await this.client<T>(key, signal);
+        this.optimisticCache.set(key, {
+          value: data,
+          expiresAt: this.nowFn() + this.cache.ttlMs,
+        });
+        return {
+          data,
+          error: null,
+          loading: false,
+          retrying: false,
+          fromCache: false,
+          attempts,
+        };
       } catch (error) {
-        lastErr = error;
-        if (signal.aborted || attempt === this.retry.maxAttempts) {
-          throw error;
+        if ((error as Error).name === "AbortError") {
+          return {
+            data: null,
+            error: { message: "Request cancelled", code: "CANCELLED" },
+            loading: false,
+            retrying: false,
+            fromCache: false,
+            attempts,
+          };
         }
-        const delay = this.retry.baseDelayMs * Math.pow(2, attempt - 1);
-        await this.sleep(delay, signal);
+
+        lastError = error;
+        if (attempt < this.retry.maxAttempts) {
+          const delay = this.retry.baseDelayMs * 2 ** (attempt - 1);
+          onRetry?.(attempt, delay);
+          await (this.retry.delayFn ?? defaultDelay)(delay);
+        }
       }
     }
-    throw lastErr;
-  }
 
-  private sleep(ms: number, signal: AbortSignal): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(resolve, ms);
-      signal.addEventListener("abort", () => {
-        clearTimeout(timer);
-        reject(new DOMException("Aborted", "AbortError"));
-      });
-    });
+    return {
+      data: null,
+      error: toApiError(lastError),
+      loading: false,
+      retrying: false,
+      fromCache: false,
+      attempts,
+    };
   }
 }

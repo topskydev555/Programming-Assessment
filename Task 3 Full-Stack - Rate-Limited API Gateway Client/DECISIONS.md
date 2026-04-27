@@ -1,31 +1,51 @@
-# Assessment Decisions
+# Architectural Decisions
 
-## Key architecture choices
+## Task 3 - Full-Stack Rate-Limited API Gateway Client
 
-- Built Task 3 as two modules (`go-client` and `mobile-app`) to keep backend-style transport concerns and frontend state concerns isolated.
-- Kept all cross-cutting concerns as composable wrappers instead of embedding logic into one large client implementation.
-- Used interface-first design (`Doer` in Go, `ApiClient` in TypeScript) so each layer can be unit tested by mocking the layer below.
+### 1) Go client built with composable decorator-style layers
 
-## Patterns used and why
+- I used a `Doer` abstraction and `Layer` function type so each cross-cutting concern wraps the next concern without direct coupling.
+- This keeps rate limiting, retry, caching, and logging independently testable by replacing the layer below with a fake `Doer`.
+- I selected this over a monolithic client implementation because a single implementation would make behavior interactions hard to isolate and harder to extend.
 
-- **Decorator / Middleware** (Go and TS): best fit for stacking rate limit, retry, cache, and logging without tight coupling.
-- **Strategy** (`ShouldRetry`, `ApiClient`): allows behavior changes without rewiring orchestration.
-- **Adapter** (`HTTPClient`, `FetchApiClient`): isolates third-party/runtime APIs (`http.Client`, `fetch`) behind project contracts.
+### 2) Retry and cache interaction explicitly controlled
 
-## Alternatives considered and rejected
+- Caching stores only successful `2xx` GET responses.
+- This avoids caching temporary failures (`5xx`) and breaking retry semantics.
+- I rejected a "cache everything" option because it can freeze failure responses and hide eventual recovery.
 
-- Monolithic HTTP wrapper with all concerns in one method: rejected due to low testability and high change risk.
-- Global singleton cache/retry manager in the mobile layer: rejected to avoid hidden mutable state across screens.
-- State management library for Task 3 mobile demo: rejected as unnecessary for scope; hook + manager kept simpler and testable.
+### 3) Time and sleep behavior injected for deterministic tests
 
-## Testing approach
+- The Go retry layer uses a `Sleeper` abstraction.
+- The mobile request manager accepts `delayFn` and `nowFn`.
+- This removes reliance on wall-clock timing in tests and keeps behavior deterministic.
 
-- Go tests validate each layer independently and a composed pipeline path.
-- TypeScript tests validate request manager behavior: dedupe, retry, and TTL cache.
-- Mocks/stubs used for deterministic behavior and no external network dependency.
+### 4) React Native hook split from orchestration engine
 
-## AI usage and review changes
+- `ApiRequestManager` contains dedupe/cache/retry/cancel mechanics as framework-agnostic logic.
+- `useApiClient` only maps manager events into UI state (`loading`, `retrying`, `fromCache`, attempts, error/data).
+- I chose this split over embedding all logic in the hook to keep logic reusable and easier to unit test in isolation.
 
-- Used AI to accelerate scaffolding of module structure, middleware contracts, and initial tests.
-- Revised generated code to keep comments simple, avoid unnecessary logging, and enforce loose coupling.
-- Added explicit cancellation handling, TTL boundaries, and predictable test doubles after review.
+### 5) Cancellation model favors safety on unmount
+
+- Hook cleanup calls `manager.cancelAll()` to abort inflight work.
+- Aborted requests map to a typed cancellation error state.
+- This prevents stale async completion from updating unmounted screens.
+
+## Patterns Used
+
+- **Decorator / middleware chain** for Go HTTP concerns.
+- **Dependency inversion** via interfaces (`Doer`, `Limiter`, `Logger`) and injected timing abstractions.
+- **Single responsibility** via dedicated layers and manager/hook separation.
+
+## Alternatives Considered and Rejected
+
+- **Single giant Go client**: rejected due to tight coupling and weak test isolation.
+- **Hook-only request logic**: rejected because behavior testing would require full React rendering for all cases.
+- **Global shared cache singleton**: rejected to avoid hidden shared state and cross-screen coupling.
+
+## AI Usage and Review Notes
+
+- AI was used to speed up scaffolding and initial layer/test implementations.
+- I manually reviewed and adjusted interactions, including a real bug fix where cache incorrectly stored `500` responses and interfered with retry.
+- I also cleaned conflicting legacy code fragments in mobile files to keep the final code coherent and testable.

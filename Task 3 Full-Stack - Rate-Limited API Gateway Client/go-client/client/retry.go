@@ -1,73 +1,77 @@
 package client
 
 import (
-	"bytes"
-	"fmt"
-	"io"
+	"errors"
 	"net/http"
 	"time"
 )
 
-type RetryConfig struct {
+type Sleeper interface {
+	Sleep(d time.Duration)
+}
+
+type realSleeper struct{}
+
+func (realSleeper) Sleep(d time.Duration) {
+	time.Sleep(d)
+}
+
+type RetryPolicy struct {
 	MaxAttempts int
 	BaseDelay   time.Duration
 	ShouldRetry func(resp *http.Response, err error) bool
+	Sleeper     Sleeper
 }
 
-func DefaultShouldRetry(resp *http.Response, err error) bool {
-	if err != nil {
-		return true
+func DefaultRetryPolicy() RetryPolicy {
+	return RetryPolicy{
+		MaxAttempts: 3,
+		BaseDelay:   100 * time.Millisecond,
+		ShouldRetry: func(resp *http.Response, err error) bool {
+			if err != nil {
+				return true
+			}
+			return resp != nil && resp.StatusCode >= 500
+		},
+		Sleeper: realSleeper{},
 	}
-	return resp != nil && resp.StatusCode >= 500
 }
 
-func WithRetry(cfg RetryConfig) Middleware {
-	if cfg.MaxAttempts <= 0 {
-		cfg.MaxAttempts = 1
+func WithRetry(policy RetryPolicy) Layer {
+	if policy.MaxAttempts < 1 {
+		policy.MaxAttempts = 1
 	}
-	if cfg.BaseDelay <= 0 {
-		cfg.BaseDelay = 50 * time.Millisecond
+	if policy.BaseDelay < 0 {
+		policy.BaseDelay = 0
 	}
-	if cfg.ShouldRetry == nil {
-		cfg.ShouldRetry = DefaultShouldRetry
+	if policy.ShouldRetry == nil {
+		policy.ShouldRetry = DefaultRetryPolicy().ShouldRetry
+	}
+	if policy.Sleeper == nil {
+		policy.Sleeper = realSleeper{}
 	}
 
 	return func(next Doer) Doer {
 		return DoerFunc(func(req *http.Request) (*http.Response, error) {
-			if req == nil {
-				return nil, fmt.Errorf("request cannot be nil")
-			}
-
-			bodyBytes, err := copyRequestBody(req)
-			if err != nil {
-				return nil, err
-			}
-
 			var lastResp *http.Response
 			var lastErr error
 
-			for attempt := 1; attempt <= cfg.MaxAttempts; attempt++ {
-				attemptReq := req.Clone(req.Context())
-				if bodyBytes != nil {
-					attemptReq.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			for attempt := 1; attempt <= policy.MaxAttempts; attempt++ {
+				resp, err := next.Do(req)
+				lastResp = resp
+				lastErr = err
+
+				if !policy.ShouldRetry(resp, err) || attempt == policy.MaxAttempts {
+					return resp, err
 				}
 
-				lastResp, lastErr = next.Do(attemptReq)
-				if !cfg.ShouldRetry(lastResp, lastErr) || attempt == cfg.MaxAttempts {
-					return lastResp, lastErr
-				}
-
-				delay := cfg.BaseDelay * time.Duration(1<<(attempt-1))
-				timer := time.NewTimer(delay)
-				select {
-				case <-req.Context().Done():
-					timer.Stop()
-					return nil, req.Context().Err()
-				case <-timer.C:
-				}
+				backoff := policy.BaseDelay * time.Duration(1<<(attempt-1))
+				policy.Sleeper.Sleep(backoff)
 			}
 
 			return lastResp, lastErr
 		})
 	}
 }
+
+var ErrRetryExhausted = errors.New("retry exhausted")
