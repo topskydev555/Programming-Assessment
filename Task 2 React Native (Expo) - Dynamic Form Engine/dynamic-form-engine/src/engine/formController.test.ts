@@ -32,6 +32,20 @@ const schema: FormSchema = {
       validation: [{ type: "required" }],
     },
     {
+      id: "startDate",
+      label: "Start Date",
+      type: "date",
+      visibleWhen: { field: "role", equals: "manager" },
+      validation: [
+        { type: "required" },
+        {
+          type: "regex",
+          value: "^\\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\\d|3[01])$",
+          message: "Start Date must use YYYY-MM-DD format",
+        },
+      ],
+    },
+    {
       id: "email",
       label: "Email",
       type: "text",
@@ -66,7 +80,13 @@ describe("FormController", () => {
   it("evaluates custom validators from registry", () => {
     const controller = new FormController({
       schema,
-      initialValues: { firstName: "Tom", role: "manager", badge: "B2", email: "bad" },
+      initialValues: {
+        firstName: "Tom",
+        role: "manager",
+        badge: "B2",
+        startDate: "2026-04-27",
+        email: "bad",
+      },
       validatorRegistry: {
         emailPolicy: (value) =>
           typeof value === "string" && value.endsWith("@company.com")
@@ -85,6 +105,7 @@ describe("FormController", () => {
         firstName: "Tom",
         role: "manager",
         badge: "B2",
+        startDate: "2026-04-27",
         email: "tom@company.com",
       },
       validatorRegistry: {
@@ -93,5 +114,29 @@ describe("FormController", () => {
     });
     const result = await controller.submit(async () => true);
     expect(result.status).toBe("success");
+  });
+
+  it("rejects invalid manager start date format", () => {
+    const controller = new FormController({
+      schema,
+      initialValues: {
+        firstName: "Tom",
+        role: "manager",
+        badge: "B2",
+        startDate: "111",
+        email: "tom@company.com",
+      },
+      validatorRegistry: {
+        emailPolicy: () => null,
+      },
+    });
+    const result = controller.validate();
+    expect(
+      result.errors.some(
+        (error) =>
+          error.fieldId === "startDate" &&
+          error.message === "Start Date must use YYYY-MM-DD format"
+      )
+    ).toBe(true);
   });
 });

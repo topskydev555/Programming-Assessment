@@ -41,7 +41,14 @@ export const defaultSchema: FormSchema = {
       label: "Start Date",
       type: "date",
       placeholder: "YYYY-MM-DD",
-      validation: [{ type: "required" }],
+      validation: [
+        { type: "required" },
+        {
+          type: "regex",
+          value: "^\\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\\d|3[01])$",
+          message: "Start Date must use YYYY-MM-DD format",
+        },
+      ],
       visibleWhen: { field: "role", equals: "manager" },
     },
     {
